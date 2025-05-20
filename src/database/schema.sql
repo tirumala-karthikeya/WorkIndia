@@ -60,6 +60,27 @@ CREATE TABLE IF NOT EXISTS bookings (
     FOREIGN KEY (to_station_id) REFERENCES stations(id) ON DELETE CASCADE
 );
 
+-- Add a new table for seats
+CREATE TABLE seats (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    train_id INT NOT NULL,
+    seat_number VARCHAR(10) NOT NULL,
+    seat_type ENUM('window', 'aisle', 'middle') NOT NULL,
+    FOREIGN KEY (train_id) REFERENCES trains(id)
+);
+
+-- Add a new table for seat bookings
+CREATE TABLE seat_bookings (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    booking_id INT NOT NULL,
+    seat_id INT NOT NULL,
+    booking_date DATE NOT NULL,
+    status ENUM('booked', 'cancelled') DEFAULT 'booked',
+    FOREIGN KEY (booking_id) REFERENCES bookings(id),
+    FOREIGN KEY (seat_id) REFERENCES seats(id),
+    UNIQUE KEY unique_seat_booking (seat_id, booking_date)
+);
+
 -- Create indexes for better performance
 CREATE INDEX idx_train_routes_train ON train_routes(train_id);
 CREATE INDEX idx_train_routes_station ON train_routes(station_id);

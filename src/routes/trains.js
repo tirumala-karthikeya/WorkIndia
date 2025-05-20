@@ -37,6 +37,21 @@ router.post('/',
 
                 const trainId = trainResult.insertId;
 
+                // Generate seat data (example: 10 seats, alternating window/aisle)
+                const seatTypes = ['window', 'aisle'];
+                const seatInserts = [];
+                for (let i = 1; i <= total_seats; i++) {
+                    const seatNumber = `A${i}`;
+                    const seatType = seatTypes[i % 2];
+                    seatInserts.push([trainId, seatNumber, seatType]);
+                }
+
+                // Bulk insert seats
+                await connection.query(
+                    'INSERT INTO seats (train_id, seat_number, seat_type) VALUES ?',
+                    [seatInserts]
+                );
+
                 // Insert stations and routes
                 for (let i = 0; i < stations.length; i++) {
                     const station = stations[i];

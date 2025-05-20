@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { auth } = require('../middleware/auth');
-const { body, validationResult } = require('express-validator');
+const { body, validationResult, query } = require('express-validator');
 
 // Book a seat
 router.post('/',
@@ -11,108 +11,63 @@ router.post('/',
         body('train_id').isInt(),
         body('from_station_id').isInt(),
         body('to_station_id').isInt(),
-        body('booking_date')
-            .isDate()
-            .custom((value) => {
-                const bookingDate = new Date(value);
-                const today = new Date();
-                // Reset time part for both dates to compare only dates
-                today.setHours(0, 0, 0, 0);
-                bookingDate.setHours(0, 0, 0, 0);
-                
-                if (bookingDate < today) {
-                    throw new Error('Booking date cannot be in the past');
-                }
-                return true;
-            }),
-        body('seats_to_book').optional().isInt({ min: 1 }).withMessage('Number of seats must be at least 1')
+        body('booking_date').isDate(),
+        body('selected_seats').isArray().notEmpty(),
+        body('selected_seats.*').isInt()
     ],
     async (req, res) => {
         const connection = await pool.getConnection();
         await connection.beginTransaction();
 
         try {
-            const errors = validationResult(req);
-            if (!errors.isEmpty()) {
-                return res.status(400).json({ errors: errors.array() });
-            }
-
-            const { train_id, from_station_id, to_station_id, booking_date } = req.body;
-            const seats_to_book = req.body.seats_to_book || 1; // Default to 1 if not specified
+            const { train_id, from_station_id, to_station_id, booking_date, selected_seats } = req.body;
             const user_id = req.user.id;
 
-            // Lock the train and get its details
-            const [train] = await connection.query(
-                'SELECT * FROM trains WHERE id = ? FOR UPDATE',
-                [train_id]
-            );
-
-            if (train.length === 0) {
-                await connection.rollback();
-                return res.status(404).json({
-                    success: false,
-                    message: 'Train not found'
-                });
-            }
-
-            // Lock and get user's existing bookings for this train
-            const [userBookings] = await connection.query(`
-                SELECT id, seats_booked
-                FROM bookings
-                WHERE train_id = ?
-                AND booking_date = ?
-                AND booking_status = 'confirmed'
-                AND user_id = ?
-                AND from_station_id = ?
-                AND to_station_id = ?
+            // Lock only the selected seats for the given date
+            const [seats] = await connection.query(`
+                SELECT s.*, sb.id as booking_id
+                FROM seats s
+                LEFT JOIN seat_bookings sb ON s.id = sb.seat_id 
+                    AND sb.booking_date = ? 
+                    AND sb.status = 'booked'
+                WHERE s.train_id = ? 
+                AND s.id IN (?)
                 FOR UPDATE
-            `, [train_id, booking_date, user_id, from_station_id, to_station_id]);
+            `, [booking_date, train_id, selected_seats]);
 
-            // Calculate seats booked by this user
-            const userSeatsBooked = userBookings.length > 0 ? userBookings[0].seats_booked : 0;
-            const newSeatsBooked = userSeatsBooked + seats_to_book;
-
-            // Get total booked seats with a lock to prevent race conditions
-            const [totalBookings] = await connection.query(`
-                SELECT COALESCE(SUM(seats_booked), 0) as booked_seats
-                FROM bookings
-                WHERE train_id = ?
-                AND booking_date = ?
-                AND booking_status = 'confirmed'
-                AND from_station_id = ?
-                AND to_station_id = ?
-                FOR UPDATE
-            `, [train_id, booking_date, from_station_id, to_station_id]);
-
-            const bookedSeats = totalBookings[0].booked_seats;
-            const availableSeats = train[0].total_seats - bookedSeats;
-
-            if (availableSeats < seats_to_book) {
+            // Check if any of the selected seats are already booked
+            const alreadyBookedSeats = seats.filter(seat => seat.booking_id !== null);
+            if (alreadyBookedSeats.length > 0) {
                 await connection.rollback();
                 return res.status(400).json({
                     success: false,
-                    message: `Only ${availableSeats} seats available`
+                    message: `Seats ${alreadyBookedSeats.map(s => s.seat_number).join(', ')} are already booked`
                 });
             }
 
-            // Calculate total fare
-            const total_fare = train[0].fare * newSeatsBooked;
-            let bookingId;
+            // Get train details for fare calculation
+            const [train] = await connection.query(
+                'SELECT * FROM trains WHERE id = ?',
+                [train_id]
+            );
 
-            if (userBookings.length > 0) {
-                // Update existing booking
-                bookingId = userBookings[0].id;
+            // Calculate total fare
+            const total_fare = train[0].fare * selected_seats.length;
+
+            // Create the main booking
+            const [bookingResult] = await connection.query(
+                'INSERT INTO bookings (user_id, train_id, from_station_id, to_station_id, booking_date, booking_status, total_fare) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [user_id, train_id, from_station_id, to_station_id, booking_date, 'confirmed', total_fare]
+            );
+
+            const bookingId = bookingResult.insertId;
+
+            // Book each selected seat
+            for (const seatId of selected_seats) {
                 await connection.query(
-                    'UPDATE bookings SET seats_booked = ?, total_fare = ? WHERE id = ?',
-                    [newSeatsBooked, total_fare, bookingId]
+                    'INSERT INTO seat_bookings (booking_id, seat_id, booking_date) VALUES (?, ?, ?)',
+                    [bookingId, seatId, booking_date]
                 );
-            } else {
-                // Create new booking
-                const [bookingResult] = await connection.query(
-                    'INSERT INTO bookings (user_id, train_id, from_station_id, to_station_id, booking_date, booking_status, seats_booked, total_fare) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                    [user_id, train_id, from_station_id, to_station_id, booking_date, 'confirmed', newSeatsBooked, total_fare]
-                );
-                bookingId = bookingResult.insertId;
             }
 
             await connection.commit();
@@ -121,10 +76,10 @@ router.post('/',
                 success: true,
                 message: 'Booking successful',
                 booking_id: bookingId,
-                seats_booked: newSeatsBooked,
-                fare: train[0].fare,
+                seats_booked: selected_seats.length,
                 total_fare: total_fare
             });
+
         } catch (err) {
             await connection.rollback();
             console.error(err);
@@ -363,6 +318,48 @@ router.patch('/:bookingId/cancel',
             });
         } finally {
             connection.release();
+        }
+    }
+);
+
+// Get seat availability
+router.get('/seats/availability',
+    auth,
+    [
+        query('train_id').isInt(),
+        query('booking_date').isDate()
+    ],
+    async (req, res) => {
+        try {
+            const { train_id, booking_date } = req.query;
+
+            const [seats] = await pool.query(`
+                SELECT 
+                    s.id,
+                    s.seat_number,
+                    s.seat_type,
+                    CASE 
+                        WHEN sb.id IS NOT NULL THEN 'booked'
+                        ELSE 'available'
+                    END as status
+                FROM seats s
+                LEFT JOIN seat_bookings sb ON s.id = sb.seat_id 
+                    AND sb.booking_date = ? 
+                    AND sb.status = 'booked'
+                WHERE s.train_id = ?
+                ORDER BY CAST(SUBSTRING(s.seat_number, 2) AS UNSIGNED)
+            `, [booking_date, train_id]);
+
+            res.json({
+                success: true,
+                seats: seats
+            });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({
+                success: false,
+                message: 'Error fetching seat availability'
+            });
         }
     }
 );
