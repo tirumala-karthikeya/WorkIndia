@@ -11,7 +11,21 @@ router.post('/',
         body('train_id').isInt(),
         body('from_station_id').isInt(),
         body('to_station_id').isInt(),
-        body('booking_date').isDate()
+        body('booking_date')
+            .isDate()
+            .custom((value) => {
+                const bookingDate = new Date(value);
+                const today = new Date();
+                // Reset time part for both dates to compare only dates
+                today.setHours(0, 0, 0, 0);
+                bookingDate.setHours(0, 0, 0, 0);
+                
+                if (bookingDate < today) {
+                    throw new Error('Booking date cannot be in the past');
+                }
+                return true;
+            }),
+        body('seats_to_book').optional().isInt({ min: 1 }).withMessage('Number of seats must be at least 1')
     ],
     async (req, res) => {
         const connection = await pool.getConnection();
@@ -24,9 +38,10 @@ router.post('/',
             }
 
             const { train_id, from_station_id, to_station_id, booking_date } = req.body;
+            const seats_to_book = req.body.seats_to_book || 1; // Default to 1 if not specified
             const user_id = req.user.id;
 
-            // Get train details including fare
+            // Lock the train and get its details
             const [train] = await connection.query(
                 'SELECT * FROM trains WHERE id = ? FOR UPDATE',
                 [train_id]
@@ -40,7 +55,7 @@ router.post('/',
                 });
             }
 
-            // Check user's existing bookings for this train
+            // Lock and get user's existing bookings for this train
             const [userBookings] = await connection.query(`
                 SELECT id, seats_booked
                 FROM bookings
@@ -50,30 +65,33 @@ router.post('/',
                 AND user_id = ?
                 AND from_station_id = ?
                 AND to_station_id = ?
+                FOR UPDATE
             `, [train_id, booking_date, user_id, from_station_id, to_station_id]);
 
             // Calculate seats booked by this user
             const userSeatsBooked = userBookings.length > 0 ? userBookings[0].seats_booked : 0;
-            const newSeatsBooked = userSeatsBooked + 1;
+            const newSeatsBooked = userSeatsBooked + seats_to_book;
 
-            // Check total seat availability
+            // Get total booked seats with a lock to prevent race conditions
             const [totalBookings] = await connection.query(`
-                SELECT COUNT(*) as booked_seats
+                SELECT COALESCE(SUM(seats_booked), 0) as booked_seats
                 FROM bookings
                 WHERE train_id = ?
                 AND booking_date = ?
                 AND booking_status = 'confirmed'
                 AND from_station_id = ?
                 AND to_station_id = ?
+                FOR UPDATE
             `, [train_id, booking_date, from_station_id, to_station_id]);
 
-            const availableSeats = train[0].total_seats - totalBookings[0].booked_seats;
+            const bookedSeats = totalBookings[0].booked_seats;
+            const availableSeats = train[0].total_seats - bookedSeats;
 
-            if (availableSeats <= 0) {
+            if (availableSeats < seats_to_book) {
                 await connection.rollback();
                 return res.status(400).json({
                     success: false,
-                    message: 'No seats available'
+                    message: `Only ${availableSeats} seats available`
                 });
             }
 
